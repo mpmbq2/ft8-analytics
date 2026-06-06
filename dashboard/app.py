@@ -18,6 +18,7 @@ import streamlit.components.v1 as components
 
 
 APP_TITLE = "ARRL Digital Contest Band Advisor"
+APP_VERSION = "1.1.0"
 WSPRNET_ENDPOINT = "https://www.wsprnet.org/drupal/wsprnet/spots/json"
 WSPR_LIVE_ENDPOINT = "https://db1.wspr.live/"
 PSK_REPORTER_ENDPOINT = (
@@ -1697,6 +1698,8 @@ def sidebar_controls() -> tuple[
             key=f"band_{band}",
         ):
             selected_bands.append(band)
+
+    st.sidebar.caption(f"v{APP_VERSION}")
 
     return (
         operator_call,
