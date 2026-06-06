@@ -1,0 +1,319 @@
+---
+title: "N9QY at the 2025 ARRL Digital Contest"
+date: "2025-06-08"
+format:
+  html:
+    code-fold: true
+    warning: false
+    message: false
+---
+
+In June 2025, operators N9QY and N9MPM entered the ARRL Digital Contest from Quincy, IL (grid EM49) — a 30-hour FT8 competition where score is built from the unique Maidenhead grid squares you can reach, across as many HF bands as propagation allows. This is a look at what their log reveals about strategy, timing, and the geographic reach of 509 contacts across five bands.
+
+```{python}
+#| label: setup
+#| include: false
+
+import math
+import io
+import polars as pl
+import altair as alt
+import plotly.graph_objects as go
+import seaborn as sns
+import matplotlib.pyplot as plt
+import gcsfs
+import google.auth
+import google.auth.transport.requests
+
+# ── Data loading ──────────────────────────────────────────────────────────────
+def _get_fs():
+    creds, _ = google.auth.default()
+    creds.refresh(google.auth.transport.requests.Request())
+    return gcsfs.GCSFileSystem(project="mccabemp", token=creds.token)
+
+fs = _get_fs()
+with fs.open("gs://project-forest-chicken/ft8-analytics/N9QY.txt", "r") as f:
+    raw_lines = f.readlines()
+
+# ── Parse Cabrillo QSO records ────────────────────────────────────────────────
+qso_lines = [l.strip() for l in raw_lines if l.startswith("QSO:")]
+records = []
+for line in qso_lines:
+    p = line.split()
+    records.append({
+        "freq_khz": int(p[1]), "mode": p[2], "date": p[3], "time": p[4],
+        "sent_call": p[5], "sent_grid": p[6], "rcvd_call": p[7],
+        "rcvd_grid": p[8], "new_mult": int(p[9]),
+    })
+
+df = pl.DataFrame(records).with_columns(
+    pl.col("date").str.strptime(pl.Date, "%Y-%m-%d"),
+    pl.col("time").str.zfill(4).str.strptime(pl.Time, "%H%M"),
+)
+
+# ── Band labels ───────────────────────────────────────────────────────────────
+band_map = {1800: "160m", 3500: "80m", 7000: "40m", 14000: "20m", 21000: "15m", 28000: "10m"}
+df_bands = df.with_columns(
+    pl.col("freq_khz").map_elements(
+        lambda f: next((v for k, v in sorted(band_map.items(), reverse=True) if f >= k), "other"),
+        return_dtype=pl.String,
+    ).alias("band")
+)
+band_order = ["10m", "15m", "20m", "40m", "80m"]
+
+# ── Grid helpers + distance ───────────────────────────────────────────────────
+def grid_to_latlon(grid):
+    g = grid.upper()
+    lon = float((ord(g[0]) - ord("A")) * 20 - 180 + (ord(g[2]) - ord("0")) * 2 + 1)
+    lat = float((ord(g[1]) - ord("A")) * 10 - 90 + (ord(g[3]) - ord("0")) * 1) + 0.5
+    return lat, lon
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    R = 6371
+    p = math.pi / 180
+    a = (math.sin((lat2 - lat1) * p / 2) ** 2
+         + math.cos(lat1 * p) * math.cos(lat2 * p) * math.sin((lon2 - lon1) * p / 2) ** 2)
+    return 2 * R * math.asin(math.sqrt(a))
+
+home_lat, home_lon = grid_to_latlon("EM49")
+
+df_full = df_bands.with_columns(
+    (pl.col("date").cast(pl.Utf8) + "T" + pl.col("time").cast(pl.Utf8))
+    .str.strptime(pl.Datetime, "%Y-%m-%dT%H:%M:%S").alias("datetime"),
+).with_columns(
+    pl.struct(["rcvd_grid"]).map_elements(
+        lambda r: haversine_km(home_lat, home_lon, *grid_to_latlon(r["rcvd_grid"])),
+        return_dtype=pl.Float64,
+    ).alias("dist_km")
+)
+```
+
+## Where did the signals go?
+
+The first thing the log tells you is *where*. 509 contacts touched 228 unique grid squares — a dense cluster across North America, a thinner layer across the Atlantic to Europe, and a handful of contacts reaching deep into the Pacific. Those outliers matter more than their count suggests, as we'll see.
+
+```{python}
+#| label: fig-map
+#| fig-cap: "Unique grid squares worked, colored by band. N9QY's home grid EM49 (Quincy, IL) is marked with a star."
+
+unique_grids = (
+    df_full.group_by("rcvd_grid")
+    .agg(pl.len().alias("qsos"), pl.col("band").first())
+    .with_columns(
+        pl.col("rcvd_grid").map_elements(lambda g: grid_to_latlon(g)[0], return_dtype=pl.Float64).alias("lat"),
+        pl.col("rcvd_grid").map_elements(lambda g: grid_to_latlon(g)[1], return_dtype=pl.Float64).alias("lon"),
+    )
+)
+
+map_fig = go.Figure()
+for band in band_order:
+    sub = unique_grids.filter(pl.col("band") == band)
+    if len(sub) == 0:
+        continue
+    map_fig.add_trace(go.Scattergeo(
+        lon=sub["lon"].to_list(), lat=sub["lat"].to_list(),
+        text=sub["rcvd_grid"].to_list(), mode="markers",
+        marker=dict(size=6, opacity=0.8), name=band,
+    ))
+
+map_fig.add_trace(go.Scattergeo(
+    lon=[home_lon], lat=[home_lat], text=["N9QY (EM49)"],
+    mode="markers", marker=dict(size=12, color="black", symbol="star"), name="N9QY",
+))
+
+map_fig.update_layout(
+    geo=dict(scope="world", showland=True, landcolor="lightgray",
+             showocean=True, oceancolor="lightblue",
+             center=dict(lon=-90, lat=35), projection_scale=2),
+    height=500, margin=dict(l=0, r=0, t=0, b=0),
+    legend=dict(orientation="h", y=-0.05),
+)
+map_fig.show()
+```
+
+## Not all bands are equal
+
+Before diving into the time series, it helps to understand what each band is capable of. HF propagation creates natural distance tiers: domestic contacts cluster around 500–3,000 km, European contacts fall around 7,000–9,000 km, and Pacific DX stretches beyond 12,000 km.
+
+```{python}
+#| label: fig-violin
+#| fig-cap: "Distribution of contact distances by band. Quartile lines are shown inside each violin."
+
+violin_df = df_full.select(["dist_km", "band"])
+
+violin_fig, ax = plt.subplots(figsize=(9, 5))
+sns.violinplot(
+    data=violin_df, x="band", y="dist_km",
+    order=band_order, hue="band", hue_order=band_order,
+    palette="tab10", inner="quart", cut=0, ax=ax,
+)
+ax.set_xlabel("Band", fontsize=12)
+ax.set_ylabel("Distance (km)", fontsize=12)
+ax.set_title("QSO Distance by Band", fontsize=14)
+ax.spines[["top", "right"]].set_visible(False)
+violin_fig.tight_layout()
+plt.show()
+```
+
+20 meters dominates — 275 contacts, spanning all three tiers. 40m is almost entirely domestic: reliable, but short. 15m, when open, concentrated contacts in the European and DX tier. And 10m? Only 21 contacts, but a high median — when 10m opens for DX, it *really* opens.
+
+## Chasing the bands
+
+The operators didn't set it and forget it. The log records 36 band changes across 30 hours — an average of more than one per hour. The contest opened on 20m at 18:00 UTC, shifted to 15m within 30 minutes as that band showed life, and tested 10m twice in the opening evening. After midnight, the higher bands faded and 40m (and briefly 80m) took over for domestic overnight contacts. By mid-morning on day two, 20m was back. The second afternoon brought repeated attempts on 15m and 10m, hunting European and Pacific DX windows until the very end.
+
+```{python}
+#| label: fig-band-transitions
+#| fig-cap: "Gantt chart of band activity. Each bar spans the time a given band was the active operating band."
+
+timeline_df = (
+    df_full.sort("datetime")
+    .with_columns(pl.col("band").shift(1).alias("prev_band"))
+    .filter(pl.col("band").ne(pl.col("prev_band")) | pl.col("prev_band").is_null())
+    .select(["datetime", "band"])
+    .with_columns(pl.col("datetime").cast(pl.Utf8))
+)
+
+rows = timeline_df.to_dicts()
+max_dt = str(df_full["datetime"].max())
+segments = []
+for i, row in enumerate(rows):
+    end = rows[i + 1]["datetime"] if i + 1 < len(rows) else max_dt
+    segments.append({"band": row["band"], "start": row["datetime"], "end": end})
+
+seg_df = pl.DataFrame(segments)
+
+alt.Chart(seg_df).mark_bar(height=30).encode(
+    x=alt.X("start:T", title="Time (UTC)"),
+    x2="end:T",
+    y=alt.Y("band:N", sort=band_order, title="Band"),
+    color=alt.Color("band:N", sort=band_order, legend=None),
+    tooltip=["band", "start", "end"],
+).properties(width=700, height=200)
+```
+
+## The pace of contacts
+
+Rate peaked in the opening half-hour of the contest and again around 03:00 UTC — likely 40m domestic during the overnight window. Activity slowed noticeably through the middle of the night before picking back up mid-morning on day two.
+
+```{python}
+#| label: fig-rate
+#| fig-cap: "QSO count per 30-minute window, stacked by band."
+
+rate_df = (
+    df_full.with_columns(pl.col("datetime").dt.truncate("30m").alias("window"))
+    .group_by(["window", "band"]).agg(pl.len().alias("qsos"))
+    .sort("window")
+    .with_columns(pl.col("window").cast(pl.Utf8))
+)
+
+alt.Chart(rate_df).mark_bar().encode(
+    x=alt.X("window:N", title="Time (UTC)", axis=alt.Axis(labelAngle=-45, labelOverlap=True)),
+    y=alt.Y("qsos:Q", title="QSOs"),
+    color=alt.Color("band:N", sort=band_order, title="Band"),
+    order=alt.Order("band:N", sort="ascending"),
+    tooltip=["window", "band", "qsos"],
+).properties(width=700, height=300)
+```
+
+## Distance over time
+
+Contact rate and distance aren't the same thing. The three charts below track distance worked — cumulatively, as a rate, and per individual QSO.
+
+The cumulative curve shows a staircase pattern: long stretches of steady, modest accumulation punctuated by steep jumps. Those jumps show up clearly in the rate chart as tall bars — and the per-QSO chart reveals exactly when they happened: the afternoon DX windows on 15m and 10m, when a single contact could add 10,000+ km in one transmission.
+
+```{python}
+#| label: fig-distance-over-time
+#| fig-cap: "Top: cumulative distance worked. Middle: total km added per 30-minute window. Bottom: average km per QSO per window."
+
+cumulative_df = (
+    df_full.sort("datetime")
+    .with_columns(pl.col("dist_km").cum_sum().alias("cumulative_km"))
+    .select(["datetime", "band", "rcvd_call", "rcvd_grid", "dist_km", "cumulative_km"])
+    .with_columns(pl.col("datetime").cast(pl.Utf8))
+)
+
+windowed_df = (
+    df_full.sort("datetime").select(["datetime", "band", "dist_km"])
+    .with_columns(pl.col("datetime").dt.truncate("30m"))
+    .group_by(["datetime", "band"])
+    .agg(pl.col("dist_km").sum().alias("km_added"), pl.len().alias("qsos"))
+    .with_columns((pl.col("km_added") / pl.col("qsos")).alias("km_per_qso"))
+    .sort("datetime")
+    .with_columns(pl.col("datetime").cast(pl.Utf8))
+)
+
+chart_cumulative = alt.Chart(cumulative_df).mark_point().encode(
+    x=alt.X("datetime:T", title=None),
+    y=alt.Y("cumulative_km:Q", title="Cumulative km"),
+    color=alt.Color("band:N", sort=band_order, title="Band"),
+    tooltip=["datetime:T", "rcvd_call:N", "rcvd_grid:N",
+             alt.Tooltip("dist_km:Q", format=".0f", title="QSO km"),
+             alt.Tooltip("cumulative_km:Q", format=".0f", title="Total km")],
+).properties(width=700, height=220)
+
+chart_dist_rate = alt.Chart(windowed_df).mark_bar().encode(
+    x=alt.X("datetime:T", title=None),
+    y=alt.Y("km_added:Q", title="km added"),
+    color=alt.Color("band:N", sort=band_order, legend=None),
+    order=alt.Order("band:N", sort="ascending"),
+    tooltip=["datetime:T", "band:N", alt.Tooltip("km_added:Q", format=".0f", title="km")],
+).properties(width=700, height=160)
+
+chart_km_per_qso = alt.Chart(windowed_df).mark_bar().encode(
+    x=alt.X("datetime:T", title="Time (UTC)"),
+    y=alt.Y("km_per_qso:Q", title="km / QSO"),
+    color=alt.Color("band:N", sort=band_order, legend=None),
+    order=alt.Order("band:N", sort="ascending"),
+    tooltip=["datetime:T", "band:N",
+             alt.Tooltip("km_per_qso:Q", format=".0f", title="km/QSO"),
+             alt.Tooltip("qsos:Q", title="QSOs")],
+).properties(width=700, height=160)
+
+(chart_cumulative & chart_dist_rate & chart_km_per_qso)
+```
+
+## The DX premium
+
+The data confirms what every contester knows but rarely quantifies: a small number of contacts do the heavy lifting.
+
+```{python}
+#| label: fig-pareto
+#| fig-cap: "Top: every QSO ranked by distance (longest first). Bottom: cumulative share of total distance — the steep early curve shows the DX premium."
+
+total_dist = df_full["dist_km"].sum()
+ranked_df = (
+    df_full.sort("dist_km", descending=True)
+    .with_row_index("rank")
+    .select(["rank", "dist_km", "band", "rcvd_call", "rcvd_grid"])
+    .with_columns((pl.col("rank") + 1).alias("rank"))
+)
+
+cumshare_df = ranked_df.with_columns(
+    (pl.col("dist_km").cum_sum() / total_dist * 100).alias("pct_of_total")
+)
+
+n50 = cumshare_df.filter(pl.col("pct_of_total") <= 50).height + 1
+n10pct = round(len(ranked_df) * 0.1)
+top10pct_share = cumshare_df.head(n10pct)["pct_of_total"].max()
+
+chart_ranked = alt.Chart(ranked_df).mark_point().encode(
+    x=alt.X("rank:Q", title="QSO rank (1 = longest)"),
+    y=alt.Y("dist_km:Q", title="Distance (km)"),
+    color=alt.Color("band:N", sort=band_order, title="Band"),
+    tooltip=["rank:Q", "rcvd_call:N", "rcvd_grid:N", "band:N",
+             alt.Tooltip("dist_km:Q", format=".0f", title="km")],
+).properties(width=700, height=260)
+
+chart_cumshare = alt.Chart(cumshare_df).mark_line().encode(
+    x=alt.X("rank:Q", title="Number of QSOs (longest first)"),
+    y=alt.Y("pct_of_total:Q", title="% of total distance"),
+    tooltip=["rank:Q", alt.Tooltip("pct_of_total:Q", format=".1f", title="% total"),
+             "rcvd_call:N", alt.Tooltip("dist_km:Q", format=".0f", title="km")],
+).properties(width=700, height=220)
+
+(chart_ranked & chart_cumshare)
+```
+
+The top **`{python} n50`** QSOs — just `{python} f"{n50/509*100:.0f}"` % of the log — accounted for half of all 1,711,606 km worked. The top 10% (`{python} n10pct` contacts) drove `{python} f"{top10pct_share:.1f}"` % of the total. Every one of those high-value contacts was a DX contact on 20m or 15m.
+
+This is the DX premium — and it's why chasing a propagation opening, even if it disrupts your rate, is almost always worth it.
