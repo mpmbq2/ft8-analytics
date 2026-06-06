@@ -1,3 +1,7 @@
-altair>=6.1.0
-pandas>=3.0.3
-streamlit>=1.46.0
+streamlit>=1,<2
+requests>=2,<3
+pandas>=3,<4
+scipy>=1,<2
+plotly>=6,<7
+maidenhead>=1,<2
+numpy>=2,<3
