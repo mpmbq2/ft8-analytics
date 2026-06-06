@@ -574,7 +574,11 @@ def fetch_psk_reporter(cache_bust: str) -> tuple[pd.DataFrame, str | None, str]:
     del cache_bust
     fetched_at = utc_now().isoformat()
     try:
-        response = requests.get(PSK_REPORTER_ENDPOINT, timeout=10)
+        response = requests.get(
+            PSK_REPORTER_ENDPOINT,
+            headers={"User-Agent": "ft8-band-advisor/1.0 (mpmbq2@gmail.com)"},
+            timeout=10,
+        )
         response.raise_for_status()
     except requests.RequestException as exc:
         return pd.DataFrame(), f"PSKReporter unavailable: {exc}", fetched_at
